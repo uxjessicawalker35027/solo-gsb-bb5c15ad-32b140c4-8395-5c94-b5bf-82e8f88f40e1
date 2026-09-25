@@ -43,6 +43,16 @@
  *  - 输出前后新增标准板数、已用余板编号、材料费总额（整数分），
  *    以及每张保留订单的分摊额与增减差值（整数分）；
  *  - 只有一张订单或订单号无效时明确报错。
+ *
+ * 可回收余料清单（offcuts）：
+ *  - 排料结束后，从每张板最终的空闲矩形（free）提取实际可取走的余料：
+ *    空闲矩形已扣除零件占位与锯缝带，彼此互不重叠，面积之和即该板余料面积；
+ *  - minOffcutLength / minOffcutWidth 为可配置的最小回收尺寸（留空或 0 = 不筛选）：
+ *    余料按当前朝向或旋转 90° 后满足 长 ≥ 最小长度 且 宽 ≥ 最小宽度 即视为可回收；
+ *  - 每项给出编号、来源板号、坐标、尺寸与面积；编号为 B{来源板号}-R{区域序号}，
+ *    区域序号为该板最终空闲区域的顺序号（从 1 起），未通过筛选的区域保留序号但
+ *    不进入清单，因此同一区域在不同筛选条件下编号稳定；
+ *  - 清单只是对排料结果的只读提取，落位与材料费分摊不受影响。
  */
 
 const EPS = 1e-9;
@@ -96,6 +106,20 @@ function parseMaxCutLength(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) {
     throw new UserError('设备最大单刀长度必须是正数（留空则不限制）');
+  }
+  return n;
+}
+
+/**
+ * 解析可回收余料的最小回收尺寸（最小长度 / 最小宽度）：
+ * 留空（undefined / null / ''）或 0 返回 0，表示不筛选、列出全部空闲余料；
+ * 填写时必须为非负数字。
+ */
+function parseMinOffcut(value, field) {
+  if (value === undefined || value === null || value === '') return 0;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) {
+    throw new UserError(`${field}必须是非负数字（留空则不筛选）`);
   }
   return n;
 }
@@ -331,6 +355,8 @@ function parseInput(input) {
     : num(input.kerf, '锯缝宽度');
   const boardPriceCents = priceToCents(input.boardPrice);
   const maxCutLength = parseMaxCutLength(input.maxCutLength);
+  const minOffcutLength = parseMinOffcut(input.minOffcutLength, '余料回收最小长度');
+  const minOffcutWidth = parseMinOffcut(input.minOffcutWidth, '余料回收最小宽度');
   const stockBoards = parseStockBoards(input.stockBoards);
 
   if (boardWidth <= 0) throw new UserError('原板长度必须大于 0');
@@ -426,6 +452,8 @@ function parseInput(input) {
     kerf,
     boardPriceCents,
     maxCutLength,
+    minOffcutLength,
+    minOffcutWidth,
     stockBoards,
     groups,
     ordersList,
@@ -636,6 +664,43 @@ function layoutParts(boardWidth, boardHeight, kerf, groups, maxCutLength, stockB
 const round3 = (v) => Math.abs(v) < EPS ? 0 : Math.round(v * 1000) / 1000;
 
 /**
+ * 可回收余料清单：从每张板最终的空闲矩形提取实际可取走的余料。
+ *  - 空闲矩形已扣除零件占位与锯缝带，彼此互不重叠，面积之和即该板余料面积；
+ *  - minLength / minWidth 为可配置的最小回收尺寸（0 = 不筛选）：余料按当前朝向
+ *    或旋转 90° 后满足 长 ≥ minLength 且 宽 ≥ minWidth 即视为可回收；
+ *  - 编号为 B{来源板号}-R{区域序号}，区域序号为该板最终空闲区域的顺序号（从 1 起），
+ *    未通过筛选的区域保留序号但不进入清单，同一区域在不同筛选条件下编号稳定。
+ * 返回 { offcuts, offcutArea }（offcutArea 为未舍入的清单总面积）。
+ */
+function collectOffcuts(boards, minLength, minWidth) {
+  const offcuts = [];
+  let offcutArea = 0;
+  boards.forEach((b, bi) => {
+    let region = 0;
+    for (const fr of b.free) {
+      if (fr.w <= EPS || fr.h <= EPS) continue;
+      region += 1;
+      const fits =
+        (fr.w >= minLength - EPS && fr.h >= minWidth - EPS) ||
+        (fr.h >= minLength - EPS && fr.w >= minWidth - EPS);
+      if (!fits) continue;
+      offcutArea += fr.w * fr.h;
+      offcuts.push({
+        id: `B${bi + 1}-R${region}`,
+        board: bi + 1,
+        region,
+        x: round3(fr.x),
+        y: round3(fr.y),
+        w: round3(fr.w),
+        h: round3(fr.h),
+        area: round3(fr.w * fr.h),
+      });
+    }
+  });
+  return { offcuts, offcutArea };
+}
+
+/**
  * 输出整理：逐板编号、刀路端点、面积统计与逐板材料费分摊（最大余数法），
  * 同时按订单汇总件数 / 面积 / 分摊额 / 所在板号。
  * ordersList：[{ order, seq }]，决定汇总与分摊的订单顺序。
@@ -755,11 +820,15 @@ function orderSummaryRows(orderSummary) {
 function cutBoards(input) {
   const parsed = parseInput(input);
   const { boardWidth, boardHeight, kerf, boardPriceCents, maxCutLength, stockBoards } = parsed;
+  const { minOffcutLength, minOffcutWidth } = parsed;
 
   const { boards, usedStockIndices } = layoutParts(
     boardWidth, boardHeight, kerf, parsed.groups, maxCutLength, stockBoards, boardPriceCents
   );
   const { resultBoards, orderSummary } = summarizeBoards(boards, parsed.ordersList);
+
+  // 可回收余料清单：只读提取各板最终空闲矩形，不影响落位与分摊
+  const { offcuts, offcutArea } = collectOffcuts(boards, minOffcutLength, minOffcutWidth);
 
   // 分单取件清单：按订单输入顺序，件内按零件行 / 件号（即切割输入顺序）
   const pickList = [...orderSummary.values()].map((summary) => {
@@ -829,6 +898,10 @@ function cutBoards(input) {
     kerf: round3(kerf),
     boardPrice: round3(boardPriceCents / 100),
     maxCutLength: maxCutLength === null ? null : round3(maxCutLength),
+    minOffcutLength: round3(minOffcutLength),
+    minOffcutWidth: round3(minOffcutWidth),
+    offcuts,
+    offcutArea: round3(offcutArea),
     stockBoards: stockBoards.map((s) => ({
       id: s.id,
       width: round3(s.width),

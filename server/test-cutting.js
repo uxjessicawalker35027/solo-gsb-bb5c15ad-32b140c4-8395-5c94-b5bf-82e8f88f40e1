@@ -734,4 +734,91 @@ assert.throws(() => cancelPreviewBoards({
   cancelOrder: '订单1',
 }), UserError, '单订单旧版输入应报错');
 
+// 38) 可回收余料清单：来自各板最终空闲矩形，面积守恒、互不重叠、不含零件与锯缝
+const ocBase = {
+  boardWidth: 1000, boardHeight: 500, kerf: 3, boardPrice: 10,
+  orders: [{ orderNo: 'A', parts: [{ name: '板', width: 400, height: 300, quantity: 1 }] }],
+};
+const oc = cutBoards(ocBase);
+assert.strictEqual(oc.boardsCount, 1);
+// 竖切优先：右 (403,0,597,500)、下 (0,303,400,197)
+assert.strictEqual(oc.offcuts.length, 2);
+assert.deepStrictEqual(oc.offcuts.map((o) => o.id), ['B1-R1', 'B1-R2']);
+const [ocR1, ocR2] = oc.offcuts;
+assert.deepStrictEqual([ocR1.board, ocR1.region, ocR1.x, ocR1.y, ocR1.w, ocR1.h], [1, 1, 403, 0, 597, 500]);
+assert.deepStrictEqual([ocR2.board, ocR2.region, ocR2.x, ocR2.y, ocR2.w, ocR2.h], [1, 2, 0, 303, 400, 197]);
+assert.strictEqual(ocR1.area, 597 * 500);
+assert.strictEqual(ocR2.area, 400 * 197);
+// 未筛选时清单面积之和 = 该板余料面积 = 总余料面积（锯缝与零件不计入）
+assert(Math.abs(oc.offcutArea - oc.boards[0].remainderArea) < 0.01);
+assert(Math.abs(oc.offcutArea - oc.remainderArea) < 0.01);
+// 余料区域两两不重叠，且不与零件占位、锯缝带重叠
+const rectOverlap = (a, b) =>
+  a.x < b.x + b.w - 1e-6 && b.x < a.x + a.w - 1e-6 &&
+  a.y < b.y + b.h - 1e-6 && b.y < a.y + a.h - 1e-6;
+for (const b of oc.boards) {
+  const rects = oc.offcuts.filter((o) => o.board === b.index);
+  for (const p of b.placements) {
+    for (const o of rects) assert(!rectOverlap(o, p), `板 ${b.index} 余料与零件重叠`);
+  }
+  for (const c of b.cuts) {
+    if (c.band.w <= 0 || c.band.h <= 0) continue; // 零宽缝带无面积
+    for (const o of rects) assert(!rectOverlap(o, c.band), `板 ${b.index} 余料与锯缝带重叠`);
+  }
+  for (let i = 0; i < rects.length; i++) {
+    for (let j = i + 1; j < rects.length; j++) {
+      assert(!rectOverlap(rects[i], rects[j]), `板 ${b.index} 余料区域互相重叠`);
+    }
+  }
+}
+// 回显筛选参数（未设置时为 0，表示不筛选）
+assert.strictEqual(oc.minOffcutLength, 0);
+assert.strictEqual(oc.minOffcutWidth, 0);
+
+// 39) 余料筛选：可配置最小长 / 宽（允许旋转匹配）；区域序号稳定、不随筛选变化
+const ocFilter = cutBoards({ ...ocBase, minOffcutLength: 500, minOffcutWidth: 100 });
+// R1 597×500 满足；R2 400×197 两个朝向的长边均 < 500 → 仅 B1-R1
+assert.deepStrictEqual(ocFilter.offcuts.map((o) => o.id), ['B1-R1']);
+assert.strictEqual(ocFilter.minOffcutLength, 500);
+assert.strictEqual(ocFilter.minOffcutWidth, 100);
+assert(Math.abs(ocFilter.offcutArea - 597 * 500) < 0.01);
+// 放宽筛选后 R2 重新入列且编号不变（区域序号为板内空闲区域顺序号）
+const ocFilter2 = cutBoards({ ...ocBase, minOffcutLength: 100, minOffcutWidth: 100 });
+assert.deepStrictEqual(ocFilter2.offcuts.map((o) => o.id), ['B1-R1', 'B1-R2']);
+// 旋转匹配：竖条 300×800，不旋转时宽 300 < 400 不满足，旋转后 800×300 满足
+const ocRot = cutBoards({
+  boardWidth: 500, boardHeight: 800, kerf: 0,
+  minOffcutLength: 400, minOffcutWidth: 250,
+  parts: [{ name: '小块', width: 200, height: 200, quantity: 1 }],
+});
+// 竖切优先：右 (200,0,300,800) 入选；下 (0,200,200,600) 旋转后宽 200 < 250 仍不满足
+assert.deepStrictEqual(ocRot.offcuts.map((o) => [o.id, o.w, o.h]), [['B1-R1', 300, 800]]);
+// 筛选参数校验：负数 / 非数字报错
+assert.throws(() => cutBoards({ ...ocBase, minOffcutLength: -1 }), UserError, '负最小长度应报错');
+assert.throws(() => cutBoards({ ...ocBase, minOffcutWidth: 'abc' }), UserError, '非数字最小宽度应报错');
+
+// 40) 余板库存板同样提取余料；多板编号按板号区分
+const ocStock = cutBoards({
+  boardWidth: 1200, boardHeight: 800, kerf: 0,
+  stockBoards: [{ id: 'S1', width: 700, height: 500 }],
+  orders: [{ orderNo: 'A', parts: [{ name: '块', width: 600, height: 400, quantity: 5 }] }],
+});
+// 板1 = 余板 S1（1 件），板2 = 标准板（4 件）
+assert.strictEqual(ocStock.boards[0].kind, 'stock');
+for (const o of ocStock.offcuts) {
+  const b = ocStock.boards[o.board - 1];
+  assert(o.x >= -1e-6 && o.y >= -1e-6 && o.x + o.w <= b.width + 1e-6 && o.y + o.h <= b.height + 1e-6,
+    `余料 ${o.id} 越出板 ${o.board}`);
+}
+const ocByBoard = new Map();
+for (const o of ocStock.offcuts) ocByBoard.set(o.board, (ocByBoard.get(o.board) || 0) + o.area);
+for (const b of ocStock.boards) {
+  assert(Math.abs((ocByBoard.get(b.index) || 0) - b.remainderArea) < 0.01,
+    `板 ${b.index} 余料清单面积与余料面积不一致`);
+}
+// 41) 补切重算的原方案同样携带余料清单，且与直接计算一致（落位 / 分摊不受影响）
+const rcOc = recutBoards({ ...ocBase, damaged: [{ order: 'A', part: '板', index: 1 }] });
+assert.deepStrictEqual(rcOc.original.offcuts, oc.offcuts);
+assert.deepStrictEqual(rcOc.original.boards, oc.boards);
+
 console.log('全部算法自检通过 ✔');
