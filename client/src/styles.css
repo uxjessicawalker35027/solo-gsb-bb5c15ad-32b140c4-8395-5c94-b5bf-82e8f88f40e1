@@ -51,6 +51,7 @@ h2:first-child { margin-top: 0; }
 
 .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
 .grid-4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px; }
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 @media (max-width: 1100px) { .grid-4 { grid-template-columns: 1fr 1fr; } }
 label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: #334155; }
 .max-cut-field { margin-top: 10px; }
@@ -153,6 +154,12 @@ input:focus { outline: 2px solid rgba(37, 99, 235, 0.35); border-color: var(--bl
   background: #ecfdf5;
   border-color: #34d399;
   color: #047857;
+  font-weight: 600;
+}
+.stock-tag.pending {
+  background: #fffbeb;
+  border-color: #f59e0b;
+  color: #b45309;
   font-weight: 600;
 }
 .stock-table .stock-unused-row td { color: var(--muted); background: #f8fafc; }
@@ -359,8 +366,31 @@ summary { cursor: pointer; font-size: 13px; color: var(--blue); }
   cursor: pointer;
   accent-color: var(--blue);
 }
+.sel-col input[type="checkbox"]:disabled { cursor: not-allowed; }
 .pick-table tr.row-selected td { background: #fffbeb; }
 .board-num.old { background: #94a3b8; }
+
+/* ---- 可回收余料清单 ---- */
+.offcut-section {
+  margin-top: 26px;
+  border-top: 2px solid #34d399;
+  padding-top: 4px;
+}
+.offcut-min-fields { margin-top: 10px; }
+.offcut-table { margin-top: 10px; }
+.offcut-table tr.board-start td { border-top: 2px solid #cbd5e1; }
+.offcut-table tr.row-selected td { background: #ecfdf5; }
+.offcut-table tr.offcut-added-row td { color: var(--muted); background: #f8fafc; }
+.offcut-section .btn.primary { margin-top: 10px; }
+.offcut-msg {
+  margin-top: 10px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: #ecfdf5;
+  border: 1px solid #34d399;
+  color: #047857;
+  font-size: 13px;
+}
 
 /* ---- 撤单影响预览 ---- */
 .cancel-section {

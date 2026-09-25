@@ -734,4 +734,122 @@ assert.throws(() => cancelPreviewBoards({
   cancelOrder: '订单1',
 }), UserError, '单订单旧版输入应报错');
 
+// 38) 可回收余料清单：来源板号 / 坐标 / 尺寸 / 面积；不计锯缝与零件、区域互不重叠
+const oc = cutBoards({
+  boardWidth: 1200, boardHeight: 800, kerf: 3, boardPrice: 10,
+  orders: [{ orderNo: 'A', parts: [{ name: '块', width: 600, height: 400, quantity: 2 }] }],
+});
+// 第一件竖切优先落 (0,0)；第二件旋转 400×600 落 (603,0) 横切优先，
+// 最终空闲矩形：(1006,0,194,600)、(0,403,600,397)、(603,603,597,197)
+assert.strictEqual(oc.offcutCount, 3);
+assert.deepStrictEqual(oc.offcuts.map((o) => [o.id, o.board, o.seq]),
+  [['B1-R1', 1, 1], ['B1-R2', 1, 2], ['B1-R3', 1, 3]]);
+assert.deepStrictEqual(oc.offcuts.map((o) => [o.x, o.y, o.width, o.height]),
+  [[1006, 0, 194, 600], [0, 403, 600, 397], [603, 603, 597, 197]]);
+assert.deepStrictEqual(oc.offcuts.map((o) => o.area), [116400, 238200, 117609]);
+// 不筛选时余料总面积 = 余料面积（板面积 − 零件 − 锯缝）
+assert.strictEqual(oc.offcutArea, oc.remainderArea);
+assert.strictEqual(oc.minOffcutLength, 0, '未配置最小长度应回显 0（不筛选）');
+assert.strictEqual(oc.minOffcutWidth, 0, '未配置最小宽度应回显 0（不筛选）');
+// 通用校验：每张板的余料区域与零件、锯缝带均不重叠，余料区域两两不重叠，且不越界
+const overlap1 = (a, b) =>
+  a.x < b.x + b.w - 1e-6 && b.x < a.x + a.w - 1e-6 &&
+  a.y < b.y + b.h - 1e-6 && b.y < a.y + a.h - 1e-6;
+for (const b of oc.boards) {
+  const rects = oc.offcuts.filter((o) => o.board === b.index)
+    .map((o) => ({ x: o.x, y: o.y, w: o.width, h: o.height }));
+  for (const r of rects) {
+    assert(r.x >= -1e-6 && r.y >= -1e-6, '余料起点越界');
+    assert(r.x + r.w <= b.width + 1e-6 && r.y + r.h <= b.height + 1e-6, '余料越界');
+    for (const p of b.placements) assert(!overlap1(r, p), '余料与零件占位重叠');
+    for (const c of b.cuts) assert(!overlap1(r, c.band), '余料与锯缝带重叠');
+  }
+  for (let i = 0; i < rects.length; i++) {
+    for (let j = i + 1; j < rects.length; j++) {
+      assert(!overlap1(rects[i], rects[j]), '余料区域之间重叠');
+    }
+  }
+}
+
+// 39) 余料筛选：按可配置的最小长度 / 最小宽度过滤，筛选后重新编区域序号
+const ocF = cutBoards({
+  boardWidth: 1200, boardHeight: 800, kerf: 3,
+  minOffcutLength: 595, minOffcutWidth: 200,
+  orders: [{ orderNo: 'A', parts: [{ name: '块', width: 600, height: 400, quantity: 2 }] }],
+});
+// 仅 600×397 同时满足 ≥595 且 ≥200；筛选后该板只有一块，重新编号为 B1-R1
+assert.strictEqual(ocF.offcutCount, 1);
+assert.strictEqual(ocF.offcuts[0].id, 'B1-R1');
+assert.deepStrictEqual([ocF.offcuts[0].width, ocF.offcuts[0].height], [600, 397]);
+assert.strictEqual(ocF.offcutArea, 238200);
+assert.strictEqual(ocF.minOffcutLength, 595);
+assert.strictEqual(ocF.minOffcutWidth, 200);
+// 边界：恰好等于阈值时保留
+const ocEdge = cutBoards({
+  boardWidth: 1200, boardHeight: 800, kerf: 3,
+  minOffcutLength: 600, minOffcutWidth: 397,
+  orders: [{ orderNo: 'A', parts: [{ name: '块', width: 600, height: 400, quantity: 2 }] }],
+});
+assert.strictEqual(ocEdge.offcutCount, 1);
+assert.strictEqual(ocEdge.offcuts[0].width, 600);
+// 阈值超过所有余料 → 空清单
+const ocNone = cutBoards({
+  boardWidth: 1200, boardHeight: 800, kerf: 3, minOffcutLength: 9999,
+  orders: [{ orderNo: 'A', parts: [{ name: '块', width: 600, height: 400, quantity: 2 }] }],
+});
+assert.strictEqual(ocNone.offcutCount, 0);
+assert.strictEqual(ocNone.offcutArea, 0);
+assert.deepStrictEqual(ocNone.offcuts, []);
+// 阈值校验：负数报错，留空 / 0 不筛选
+assert.throws(() => cutBoards({
+  boardWidth: 1000, boardHeight: 1000, minOffcutLength: -1,
+  orders: [{ orderNo: 'X', parts: [{ name: 'a', width: 10, height: 10, quantity: 1 }] }],
+}), UserError, '负的最小余料长度应报错');
+assert.throws(() => cutBoards({
+  boardWidth: 1000, boardHeight: 1000, minOffcutWidth: 'abc',
+  orders: [{ orderNo: 'X', parts: [{ name: 'a', width: 10, height: 10, quantity: 1 }] }],
+}), UserError, '非数字最小余料宽度应报错');
+assert.doesNotThrow(() => cutBoards({
+  boardWidth: 1000, boardHeight: 1000, minOffcutLength: 0, minOffcutWidth: '',
+  orders: [{ orderNo: 'X', parts: [{ name: 'a', width: 10, height: 10, quantity: 1 }] }],
+}), '0 或留空应表示不筛选');
+
+// 40) 余料清单跨板编号：编号含来源板号；整板铺满时该板无余料
+const ocMulti = cutBoards({
+  boardWidth: 1200, boardHeight: 800, kerf: 0,
+  orders: [{ orderNo: 'A', parts: [{ name: '块', width: 600, height: 400, quantity: 5 }] }],
+});
+assert.strictEqual(ocMulti.boardsCount, 2);
+// 板1 恰好 2×2 铺满无余料；板2 放 1 件，竖切优先余 (600,0,600,800) 与 (0,400,600,400)
+assert.deepStrictEqual(ocMulti.offcuts.map((o) => o.id), ['B2-R1', 'B2-R2']);
+assert.deepStrictEqual(ocMulti.offcuts.map((o) => o.board), [2, 2]);
+assert.strictEqual(ocMulti.offcutArea, ocMulti.remainderArea);
+
+// 41) 余板库存板同样产生可回收余料；追加场景下的编号唯一性（板号 + 区域序号）
+const ocStock = cutBoards({
+  boardWidth: 1200, boardHeight: 800, kerf: 0,
+  stockBoards: [{ id: 'S1', width: 700, height: 500 }],
+  orders: [{ orderNo: 'A', parts: [{ name: '块', width: 600, height: 400, quantity: 1 }] }],
+});
+assert.strictEqual(ocStock.boards[0].kind, 'stock');
+assert.deepStrictEqual(ocStock.offcuts.map((o) => [o.id, o.x, o.y, o.width, o.height]),
+  [['B1-R1', 600, 0, 100, 500], ['B1-R2', 0, 400, 600, 100]]);
+assert.strictEqual(ocStock.offcutArea, ocStock.boards[0].remainderArea);
+// 同一方案内余料编号唯一
+assert.strictEqual(new Set(ocStock.offcuts.map((o) => o.id)).size, ocStock.offcuts.length);
+
+// 42) 余料清单不影响落位与分摊：配置阈值前后方案主体完全一致
+const ocBase = cutBoards({
+  boardWidth: 1200, boardHeight: 800, kerf: 3, boardPrice: 10,
+  orders: [{ orderNo: 'A', parts: [{ name: '块', width: 600, height: 400, quantity: 2 }] }],
+});
+const ocConf = cutBoards({
+  boardWidth: 1200, boardHeight: 800, kerf: 3, boardPrice: 10,
+  minOffcutLength: 500, minOffcutWidth: 500,
+  orders: [{ orderNo: 'A', parts: [{ name: '块', width: 600, height: 400, quantity: 2 }] }],
+});
+assert.deepStrictEqual(ocConf.boards, ocBase.boards, '余料筛选不得改变落位');
+assert.deepStrictEqual(ocConf.orders, ocBase.orders, '余料筛选不得改变费用分摊');
+assert.strictEqual(ocConf.totalMaterialCents, ocBase.totalMaterialCents);
+
 console.log('全部算法自检通过 ✔');

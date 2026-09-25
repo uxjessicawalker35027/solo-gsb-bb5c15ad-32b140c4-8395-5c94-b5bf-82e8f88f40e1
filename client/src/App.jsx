@@ -43,12 +43,22 @@ const validateMaxCut = (value) => {
   return Number.isFinite(n) && n > 0;
 };
 
+// 可回收余料最小长度 / 宽度：留空表示不筛选；填写时必须为非负数
+const validateOffcutMin = (value) => {
+  const s = String(value).trim();
+  if (s === '') return true;
+  const n = Number(s);
+  return Number.isFinite(n) && n >= 0;
+};
+
 export default function App() {
   const [boardWidth, setBoardWidth] = useState(String(SAMPLE_BOARD.boardWidth));
   const [boardHeight, setBoardHeight] = useState(String(SAMPLE_BOARD.boardHeight));
   const [kerf, setKerf] = useState(String(SAMPLE_BOARD.kerf));
   const [boardPrice, setBoardPrice] = useState(String(SAMPLE_BOARD.boardPrice));
   const [maxCutLength, setMaxCutLength] = useState('');
+  const [minOffcutLength, setMinOffcutLength] = useState('');
+  const [minOffcutWidth, setMinOffcutWidth] = useState('');
   const [stocks, setStocks] = useState(SAMPLE_STOCKS.map((s) => ({ ...s })));
   const [orders, setOrders] = useState(SAMPLE_ORDERS.map((o) => ({
     orderNo: o.orderNo,
@@ -68,6 +78,10 @@ export default function App() {
   const [cancelPreview, setCancelPreview] = useState(null);
   const [cancelError, setCancelError] = useState('');
   const [cancelLoading, setCancelLoading] = useState(false);
+  // 可回收余料清单：勾选的余料编号、已追加到库存的余料编号（同一方案不重复追加）、追加提示
+  const [offcutSelected, setOffcutSelected] = useState(new Set());
+  const [offcutAdded, setOffcutAdded] = useState(new Set());
+  const [offcutMsg, setOffcutMsg] = useState('');
 
   // ---- 订单 / 零件行编辑 ----
   const updateOrder = (oi, key, value) => {
@@ -113,18 +127,27 @@ export default function App() {
     setCancelError('');
   };
 
+  const resetOffcuts = () => {
+    setOffcutSelected(new Set());
+    setOffcutAdded(new Set());
+    setOffcutMsg('');
+  };
+
   const loadSample = () => {
     setBoardWidth(String(SAMPLE_BOARD.boardWidth));
     setBoardHeight(String(SAMPLE_BOARD.boardHeight));
     setKerf(String(SAMPLE_BOARD.kerf));
     setBoardPrice(String(SAMPLE_BOARD.boardPrice));
     setMaxCutLength('');
+    setMinOffcutLength('');
+    setMinOffcutWidth('');
     setStocks(SAMPLE_STOCKS.map((s) => ({ ...s })));
     setOrders(SAMPLE_ORDERS.map((o) => ({ orderNo: o.orderNo, parts: o.parts.map((p) => ({ ...p })) })));
     setResult(null);
     setError('');
     resetRecut();
     resetCancel();
+    resetOffcuts();
   };
 
   // 组装请求载荷并校验余板行：全空行忽略；非空行必须编号唯一且长 / 宽为正数
@@ -153,6 +176,9 @@ export default function App() {
       boardPrice: boardPrice === '' ? 0 : Number(boardPrice),
       // 留空不下发该字段：后端按不限制处理，沿用现有排料规则
       ...(maxCutLength.trim() !== '' ? { maxCutLength: Number(maxCutLength) } : {}),
+      // 可回收余料筛选阈值：留空不下发，后端按不筛选（列出全部空闲矩形）处理
+      ...(minOffcutLength.trim() !== '' ? { minOffcutLength: Number(minOffcutLength) } : {}),
+      ...(minOffcutWidth.trim() !== '' ? { minOffcutWidth: Number(minOffcutWidth) } : {}),
       stockBoards,
       orders: orders.map((o) => ({
         orderNo: o.orderNo,
@@ -174,6 +200,10 @@ export default function App() {
       setError('设备最大单刀长度必须为正数（留空则不限制）');
       return;
     }
+    if (!validateOffcutMin(minOffcutLength) || !validateOffcutMin(minOffcutWidth)) {
+      setError('可回收余料最小长度 / 最小宽度必须是非负数字（留空则不筛选）');
+      return;
+    }
     const { payload, error: stockError } = buildPayload();
     if (stockError) {
       setError(stockError);
@@ -182,6 +212,7 @@ export default function App() {
     setResult(null);
     resetRecut();
     resetCancel();
+    resetOffcuts();
     setLoading(true);
     try {
       const res = await fetch('/api/cut', {
@@ -287,11 +318,66 @@ export default function App() {
     }
   };
 
+  // ---- 可回收余料清单：勾选 → 一键追加到临时余板库存 ----
+  const toggleOffcut = (id) => {
+    setOffcutSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  // 全选 / 清空（仅针对尚未追加的清单项）
+  const toggleAllOffcuts = () => {
+    if (!result || !result.offcuts) return;
+    const selectable = result.offcuts.filter((o) => !offcutAdded.has(o.id)).map((o) => o.id);
+    setOffcutSelected((prev) => (prev.size === selectable.length ? new Set() : new Set(selectable)));
+  };
+
+  // 一键追加：编号取后端建议编号（B{来源板号}-R{区域序号}），
+  // 与表单已有编号或本批次编号冲突时自动追加 -2 / -3… 避让；
+  // 已追加过的清单项直接跳过，同一方案重复操作不重复追加；
+  // 仅修改表单库存，不重新计算，当前方案的落位与费用分摊保持不变
+  const appendOffcuts = () => {
+    if (!result || !result.offcuts) return;
+    const items = result.offcuts.filter((o) => offcutSelected.has(o.id) && !offcutAdded.has(o.id));
+    if (items.length === 0) {
+      setOffcutMsg(
+        offcutSelected.size > 0
+          ? '所选余料均已追加过，同一方案不重复追加'
+          : '请先勾选要追加的余料'
+      );
+      return;
+    }
+    const usedIds = new Set(stocks.map((s) => String(s.id ?? '').trim()).filter(Boolean));
+    const newRows = [];
+    const nowAdded = [];
+    for (const o of items) {
+      let id = o.id;
+      let n = 2;
+      while (usedIds.has(id)) {
+        id = `${o.id}-${n}`;
+        n += 1;
+      }
+      usedIds.add(id);
+      newRows.push({ id, width: o.width, height: o.height });
+      nowAdded.push(o.id);
+    }
+    setStocks((prev) => [...prev, ...newRows]);
+    setOffcutAdded((prev) => new Set([...prev, ...nowAdded]));
+    setOffcutSelected(new Set());
+    setOffcutMsg(
+      `已把 ${newRows.length} 块余料追加到左侧「临时余板库存」（编号：${newRows.map((r) => r.id).join('、')}），` +
+      '下一次生成方案时参与排料；当前方案的落位与费用分摊保持不变'
+    );
+  };
+
   return (
     <div className="page">
       <header className="site-header">
         <h1>矩形板材下料 · 多订单拼版断头切割排料</h1>
-        <p>多张订单混合拼版：按订单与零件行顺序断头切割，可登记带唯一编号的临时余板库存（已开板放不下时先用余板、最后开标准新板），结果保留订单归属，按单取件并分摊材料费；损坏件可勾选后生成独立补切方案；还可按订单预览撤单前后影响（原方案与表单不变）</p>
+        <p>多张订单混合拼版：按订单与零件行顺序断头切割，可登记带唯一编号的临时余板库存（已开板放不下时先用余板、最后开标准新板），结果保留订单归属，按单取件并分摊材料费；损坏件可勾选后生成独立补切方案；还可按订单预览撤单前后影响（原方案与表单不变）；方案生成后自动列出可回收余料清单，可勾选一键追加为临时余板库存供下一次排料</p>
       </header>
 
       <main className="layout">
@@ -326,12 +412,29 @@ export default function App() {
                 placeholder="如 800"
                 onChange={(e) => setMaxCutLength(e.target.value)} />
             </label>
+            <div className="grid-2 offcut-min-fields">
+              <label>
+                可回收余料最小长度（选填）
+                <input type="number" step="any" min="0" value={minOffcutLength}
+                  placeholder="留空不筛选"
+                  onChange={(e) => setMinOffcutLength(e.target.value)} />
+              </label>
+              <label>
+                可回收余料最小宽度（选填）
+                <input type="number" step="any" min="0" value={minOffcutWidth}
+                  placeholder="留空不筛选"
+                  onChange={(e) => setMinOffcutWidth(e.target.value)} />
+              </label>
+            </div>
             <p className="hint">
               长度 / 宽度单位保持一致即可（通常为 mm）；材料价非负、最多两位小数，
               每张开料板均按此价计费，再按各订单在该板的零件面积比例分摊。
               <b>设备最大单刀长度</b>留空时沿用全部既有排料规则；填写后必须为正数，
               系统会对每个候选落位与朝向分别核算竖切优先、横切优先的实际刀长，
               只有该切法<b>每一刀均不超过此上限</b>才会采用，不输出超限刀路。
+              <b>可回收余料最小长度 / 宽度</b>用于筛选结果中的可回收余料清单：
+              仅当余料沿板长方向尺寸 ≥ 最小长度、沿板宽方向尺寸 ≥ 最小宽度时才列入，
+              两项均留空则列出全部空闲矩形。
             </p>
 
             <div className="parts-head">
@@ -354,7 +457,10 @@ export default function App() {
                 </div>
               )}
               {stocks.map((s, si) => {
-                const used = result?.stockUsed?.find((u) => u.id === String(s.id).trim());
+                const rowId = String(s.id ?? '').trim();
+                const used = result?.stockUsed?.find((u) => u.id === rowId);
+                // 结果页联动：编号不在本次方案库存快照中（多为方案生成后由余料清单追加）→ 待排料
+                const inSnapshot = !result || result.stockBoards.some((u) => u.id === rowId);
                 return (
                   <div className="part-row stock-row" key={si}>
                     <input type="text" value={s.id} placeholder="如 YB-01（唯一）"
@@ -365,7 +471,9 @@ export default function App() {
                       onChange={(e) => updateStock(si, 'height', e.target.value)} />
                     <span className="stock-note-col">
                       {used ? <span className="stock-tag used">已用 · 第 {used.board} 板</span>
-                        : result ? <span className="stock-tag">未用</span> : null}
+                        : !result ? null
+                        : !inSnapshot ? <span className="stock-tag pending">待排料 · 下次生效</span>
+                        : <span className="stock-tag">未用</span>}
                     </span>
                     <button type="button" className="btn icon op-col" title="删除该余板"
                       onClick={() => removeStock(si)}>✕</button>
@@ -455,6 +563,7 @@ export default function App() {
                 <li>每板材料费按订单零件面积比例分摊（最大余数法分配分位尾差）</li>
                 <li>在分单取件清单勾选损坏件，可生成独立的缺件补切方案（补切只开标准新板，不耗用余板）</li>
                 <li>选择一张订单即可预览撤单影响：按生成方案时的输入快照对比撤单前后用板与材料费，原方案不变</li>
+                <li>可回收余料清单列出每张板实际可取走的余料（不含锯缝与零件占位），可按最小长 / 宽筛选，勾选后一键追加为临时余板库存供下一次排料</li>
               </ul>
             </div>
           )}
@@ -462,6 +571,15 @@ export default function App() {
           {result && (
             <>
               <ResultView result={result} selected={selected} onToggleDamaged={toggleDamaged} />
+              <OffcutSection
+                result={result}
+                selected={offcutSelected}
+                added={offcutAdded}
+                message={offcutMsg}
+                onToggle={toggleOffcut}
+                onToggleAll={toggleAllOffcuts}
+                onAppend={appendOffcuts}
+              />
               <RecutSection
                 selectedCount={selected.size}
                 recut={recut}
@@ -484,7 +602,7 @@ export default function App() {
       </main>
 
       <footer className="site-footer">
-        断头切割规则：每一刀都贯穿当前所在矩形区域 · 允许零件旋转 90° · 按订单与零件行固定顺序排料 · 补切仅重排所选损坏件，原方案不变 · 撤单预览按输入快照对比前后方案，表单与原方案不变
+        断头切割规则：每一刀都贯穿当前所在矩形区域 · 允许零件旋转 90° · 按订单与零件行固定顺序排料 · 补切仅重排所选损坏件，原方案不变 · 撤单预览按输入快照对比前后方案，表单与原方案不变 · 可回收余料取自每张板最终空闲矩形（不含锯缝与零件占位、互不重叠），追加到临时余板库存后下一次排料生效
       </footer>
     </div>
   );
@@ -744,6 +862,102 @@ function ResultView({ result, selected, onToggleDamaged }) {
         </div>
       ))}
     </>
+  );
+}
+
+/**
+ * 可回收余料清单区块：展示每张板最终空闲矩形中实际可取走的余料
+ * （锯缝与零件占位已扣除、区域互不重叠），按表单的最小长度 / 最小宽度筛选；
+ * 勾选后一键追加到左侧「临时余板库存」供下一次排料——编号取 B{来源板号}-R{区域序号}，
+ * 与已有编号冲突时自动避让，同一方案重复操作不重复追加；
+ * 追加只修改表单库存，当前方案的落位与费用分摊保持不变。
+ */
+function OffcutSection({ result, selected, added, message, onToggle, onToggleAll, onAppend }) {
+  const offcuts = result.offcuts || [];
+  const minL = result.minOffcutLength || 0;
+  const minW = result.minOffcutWidth || 0;
+  const selectable = offcuts.filter((o) => !added.has(o.id));
+  const allChecked = selectable.length > 0 && selected.size === selectable.length;
+  return (
+    <div className="offcut-section">
+      <h2 className="section-title">可回收余料清单</h2>
+      <p className="hint">
+        取自每张板<b>最终空闲矩形</b>：锯缝与零件占位均已扣除、区域互不重叠，即可实际取走的余料。
+        {minL > 0 || minW > 0 ? (
+          <>当前筛选：沿板长方向 ≥ <b>{strip(minL)}</b>、沿板宽方向 ≥ <b>{strip(minW)}</b>
+            （在左侧表单修改阈值后重新生成方案生效）。</>
+        ) : '未设置最小长度 / 宽度，列出全部空闲矩形（可在左侧表单配置筛选阈值）。'}
+        勾选后一键追加到左侧「临时余板库存」供<b>下一次排料</b>使用；
+        编号由来源板号与区域序号生成，与已有编号冲突时自动避让，同一方案重复操作不重复追加；
+        追加不影响当前方案的落位与费用分摊。
+      </p>
+
+      {offcuts.length === 0 ? (
+        <p className="hint">当前筛选条件下没有可回收余料。</p>
+      ) : (
+        <>
+          <table className="detail-table offcut-table">
+            <thead>
+              <tr>
+                <th className="sel-col">
+                  <input
+                    type="checkbox"
+                    checked={allChecked}
+                    onChange={onToggleAll}
+                    title="全选 / 清空（不含已追加项）"
+                  />
+                </th>
+                <th>建议编号</th><th>来源板号</th><th>位置 x,y</th>
+                <th>尺寸 长×宽</th><th>面积</th><th>状态</th>
+              </tr>
+            </thead>
+            <tbody>
+              {offcuts.map((o, i) => {
+                const isAdded = added.has(o.id);
+                const checked = selected.has(o.id);
+                return (
+                  <tr key={o.id}
+                    className={`${i > 0 && o.board !== offcuts[i - 1].board ? 'board-start' : ''} ${checked ? 'row-selected' : ''} ${isAdded ? 'offcut-added-row' : ''}`}>
+                    <td className="sel-col">
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        disabled={isAdded}
+                        onChange={() => onToggle(o.id)}
+                        title={isAdded ? '已追加到临时余板库存' : '勾选后可追加到临时余板库存'}
+                      />
+                    </td>
+                    <td>{o.id}</td>
+                    <td><span className="board-num">{o.board}</span></td>
+                    <td>{strip(o.x)}, {strip(o.y)}</td>
+                    <td>{strip(o.width)} × {strip(o.height)}</td>
+                    <td>{fmt(o.area)}</td>
+                    <td>{isAdded ? <span className="stock-tag used">已追加</span> : <span className="stock-tag">可回收</span>}</td>
+                  </tr>
+                );
+              })}
+              <tr className="sum-row">
+                <td className="sel-col"></td>
+                <td>合计</td>
+                <td colSpan="3">{result.offcutCount} 块可回收余料</td>
+                <td>{fmt(result.offcutArea)}</td>
+                <td></td>
+              </tr>
+            </tbody>
+          </table>
+          <button
+            type="button"
+            className="btn primary"
+            disabled={selected.size === 0}
+            onClick={onAppend}
+          >
+            追加选中余料到临时余板库存（已选 {selected.size} 块）
+          </button>
+        </>
+      )}
+
+      {message && <p className="hint offcut-msg">{message}</p>}
+    </div>
   );
 }
 

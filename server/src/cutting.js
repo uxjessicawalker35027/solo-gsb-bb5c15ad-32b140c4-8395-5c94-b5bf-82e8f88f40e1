@@ -43,6 +43,15 @@
  *  - 输出前后新增标准板数、已用余板编号、材料费总额（整数分），
  *    以及每张保留订单的分摊额与增减差值（整数分）；
  *  - 只有一张订单或订单号无效时明确报错。
+ *
+ * 可回收余料清单（offcuts）：
+ *  - 排料结束后，每张板的最终空闲矩形即“实际可取走”的余料：零件占位与锯缝带
+ *    在排料过程中已从空闲矩形中扣除，矩形之间两两不重叠；
+ *  - 按可配置的最小长度 minOffcutLength、最小宽度 minOffcutWidth 筛选
+ *    （留空 / 为 0 表示不筛选；余料沿板长方向尺寸 ≥ 最小长度、沿板宽方向尺寸 ≥ 最小宽度）；
+ *  - 每张板内满足条件的余料按位置（先上后下、先左后右）从 1 编区域序号，
+ *    建议编号为 B{来源板号}-R{区域序号}，清单展示来源板号、坐标、尺寸与面积；
+ *  - 清单仅是结果展示，不影响落位与材料费分摊。
  */
 
 const EPS = 1e-9;
@@ -96,6 +105,21 @@ function parseMaxCutLength(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) {
     throw new UserError('设备最大单刀长度必须是正数（留空则不限制）');
+  }
+  return n;
+}
+
+/**
+ * 解析可回收余料的最小尺寸阈值（最小长度 / 最小宽度）：
+ * 留空（undefined / null / ''）返回 0，表示不筛选、列出全部空闲矩形；
+ * 填写时必须为非负数字。余料矩形沿板长方向尺寸 ≥ 最小长度、
+ * 沿板宽方向尺寸 ≥ 最小宽度时才列入可回收余料清单。
+ */
+function parseOffcutMin(value, field) {
+  if (value === undefined || value === null || value === '') return 0;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) {
+    throw new UserError(`${field}必须是非负数字（留空则不筛选）`);
   }
   return n;
 }
@@ -332,6 +356,8 @@ function parseInput(input) {
   const boardPriceCents = priceToCents(input.boardPrice);
   const maxCutLength = parseMaxCutLength(input.maxCutLength);
   const stockBoards = parseStockBoards(input.stockBoards);
+  const minOffcutLength = parseOffcutMin(input.minOffcutLength, '可回收余料最小长度');
+  const minOffcutWidth = parseOffcutMin(input.minOffcutWidth, '可回收余料最小宽度');
 
   if (boardWidth <= 0) throw new UserError('原板长度必须大于 0');
   if (boardHeight <= 0) throw new UserError('原板宽度必须大于 0');
@@ -427,6 +453,8 @@ function parseInput(input) {
     boardPriceCents,
     maxCutLength,
     stockBoards,
+    minOffcutLength,
+    minOffcutWidth,
     groups,
     ordersList,
     totalQty,
@@ -636,6 +664,40 @@ function layoutParts(boardWidth, boardHeight, kerf, groups, maxCutLength, stockB
 const round3 = (v) => Math.abs(v) < EPS ? 0 : Math.round(v * 1000) / 1000;
 
 /**
+ * 从每张板的最终空闲矩形提取可回收余料清单。
+ * 空闲矩形由排料过程维护：零件占位与锯缝带均已从区域中扣除，
+ * 矩形两两不重叠，即“实际可取走”的余料。
+ * 每张板内满足筛选条件（长 ≥ minLength 且 宽 ≥ minWidth，0 表示不筛选）的余料
+ * 按位置（先上后下、先左后右）排序后从 1 编区域序号，
+ * 建议编号为 B{来源板号}-R{区域序号}。
+ * 返回 { offcuts, totalArea }：offcuts 含来源板号、坐标、尺寸与面积（已 round3），
+ * totalArea 为筛选后余料总面积（未舍入，由调用方统一 round）。
+ */
+function collectOffcuts(boards, minLength, minWidth) {
+  const offcuts = [];
+  let totalArea = 0;
+  boards.forEach((b, bi) => {
+    const rects = b.free
+      .filter((r) => r.w + EPS >= minLength && r.h + EPS >= minWidth)
+      .sort((a, c) => (a.y - c.y) || (a.x - c.x));
+    rects.forEach((r, ri) => {
+      totalArea += r.w * r.h;
+      offcuts.push({
+        id: `B${bi + 1}-R${ri + 1}`,
+        board: bi + 1,
+        seq: ri + 1,
+        x: round3(r.x),
+        y: round3(r.y),
+        width: round3(r.w),
+        height: round3(r.h),
+        area: round3(r.w * r.h),
+      });
+    });
+  });
+  return { offcuts, totalArea };
+}
+
+/**
  * 输出整理：逐板编号、刀路端点、面积统计与逐板材料费分摊（最大余数法），
  * 同时按订单汇总件数 / 面积 / 分摊额 / 所在板号。
  * ordersList：[{ order, seq }]，决定汇总与分摊的订单顺序。
@@ -761,6 +823,12 @@ function cutBoards(input) {
   );
   const { resultBoards, orderSummary } = summarizeBoards(boards, parsed.ordersList);
 
+  // 可回收余料清单：每张板最终空闲矩形（已扣除零件占位与锯缝带、互不重叠），
+  // 按可配置的最小长度 / 最小宽度筛选；仅作展示，不影响落位与分摊
+  const { offcuts, totalArea: offcutTotalArea } = collectOffcuts(
+    boards, parsed.minOffcutLength, parsed.minOffcutWidth
+  );
+
   // 分单取件清单：按订单输入顺序，件内按零件行 / 件号（即切割输入顺序）
   const pickList = [...orderSummary.values()].map((summary) => {
     const items = [];
@@ -829,6 +897,8 @@ function cutBoards(input) {
     kerf: round3(kerf),
     boardPrice: round3(boardPriceCents / 100),
     maxCutLength: maxCutLength === null ? null : round3(maxCutLength),
+    minOffcutLength: round3(parsed.minOffcutLength),
+    minOffcutWidth: round3(parsed.minOffcutWidth),
     stockBoards: stockBoards.map((s) => ({
       id: s.id,
       width: round3(s.width),
@@ -845,6 +915,9 @@ function cutBoards(input) {
     remainderArea: round3(remainderArea),
     utilization: Math.round((partsArea / totalArea) * 1000) / 10,
     totalMaterialCents,
+    offcuts,
+    offcutCount: offcuts.length,
+    offcutArea: round3(offcutTotalArea),
     orders,
     pickList,
     boards: resultBoards,
